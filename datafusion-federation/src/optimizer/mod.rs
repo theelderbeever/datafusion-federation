@@ -156,6 +156,15 @@ impl FederationOptimizerRule {
 
         // Return early if this is a leaf and there is no ambiguity with the expressions.
         if leaf_provider.is_some() && (exprs_result.is_none() || exprs_result == leaf_provider) {
+            if is_root {
+                // A bare TableScan as the root of the plan (e.g. `SELECT * FROM t`
+                // once redundant projections are removed) must still be federated.
+                if let Some(optimizer) = leaf_provider.as_ref().and_then(|p| p.optimizer()) {
+                    let wrapped = wrap_projection(plan.clone())?;
+                    let optimized = optimizer.optimize(wrapped, _config, |_, _| {})?;
+                    return Ok((Some(optimized), ScanResult::None));
+                }
+            }
             return Ok((None, leaf_provider.into()));
         }
         // Aggregate leaf & expression providers

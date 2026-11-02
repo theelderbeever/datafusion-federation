@@ -163,3 +163,51 @@ async fn cross_provider_join() {
         "sqlite remote must not see the postgres table: {sqlite_sql}"
     );
 }
+
+/// When a remote table can only be federated on its own (here: semi-joined via
+/// `IN (SELECT ...)` against another remote), only the columns the query needs
+/// are requested from it.
+#[tokio::test]
+async fn cross_provider_semi_join_prunes_columns() {
+    use datafusion::execution::context::SessionContext;
+    use datafusion_federation::sql::MultiSchemaProvider;
+    use std::sync::Arc;
+
+    let sqlite_ctx = remote_ctx("test_sqlite", "test.csv").await;
+    let sqlite_exec = RecordingSQLExecutor::new("sqlite", "sqlite_exec", sqlite_ctx);
+    let sqlite_queries = sqlite_exec.queries();
+    let sqlite_schema = schema_provider(Arc::new(sqlite_exec), &["test_sqlite"]).await;
+
+    let pg_ctx = remote_ctx("test_pg", "test2.csv").await;
+    let pg_exec = RecordingSQLExecutor::new("postgres", "postgres_exec", pg_ctx);
+    let pg_queries = pg_exec.queries();
+    let pg_schema = schema_provider(Arc::new(pg_exec), &["test_pg"]).await;
+
+    let state = datafusion_federation::default_session_state();
+    support::overwrite_default_schema(
+        &state,
+        Arc::new(MultiSchemaProvider::new(vec![sqlite_schema, pg_schema])),
+    );
+    let ctx = SessionContext::new_with_state(state);
+
+    let batches = support::collect(
+        ctx.sql("SELECT foo FROM test_pg WHERE foo IN (SELECT foo FROM test_sqlite)")
+            .await
+            .expect("plan semi join"),
+    )
+    .await;
+
+    // foo in {a,b,c} on both sides -> 3 matching rows.
+    assert_eq!(row_count(&batches), 3);
+
+    let pg_sql = recorded_sql(&pg_queries);
+    let sqlite_sql = recorded_sql(&sqlite_queries);
+    assert!(
+        !pg_sql.contains("bar"),
+        "postgres remote should only fetch `foo`: {pg_sql}"
+    );
+    assert!(
+        !sqlite_sql.contains("bar"),
+        "sqlite remote should only fetch `foo`: {sqlite_sql}"
+    );
+}

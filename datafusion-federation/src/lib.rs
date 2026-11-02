@@ -13,7 +13,7 @@ use std::{
 
 use datafusion::{
     execution::session_state::{SessionState, SessionStateBuilder},
-    optimizer::{optimizer::Optimizer, OptimizerRule},
+    optimizer::{optimize_projections::OptimizeProjections, optimizer::Optimizer, OptimizerRule},
 };
 
 pub use optimizer::{get_table_source, FederationOptimizerRule};
@@ -47,8 +47,14 @@ pub fn default_optimizer_rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
 
     // TODO: check if we should allow other optimizers to run before the federation rule.
 
+    // Prune unused columns before federating. When a table can only be federated
+    // on its own (e.g. joined or semi-joined against another provider), the
+    // federation rule wraps its bare `TableScan` in a projection of every column,
+    // and the resulting federated node is opaque to later `optimize_projections`
+    // passes, so without this the remote query selects all columns.
     let federation_rule = Arc::new(FederationOptimizerRule::new());
-    default_rules.insert(pos + 1, federation_rule);
+    default_rules.insert(pos + 1, Arc::new(OptimizeProjections::new()));
+    default_rules.insert(pos + 2, federation_rule);
 
     default_rules
 }
