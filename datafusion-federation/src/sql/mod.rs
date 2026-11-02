@@ -19,7 +19,7 @@ use datafusion::{
     config::ConfigOptions,
     error::{DataFusionError, Result},
     execution::TaskContext,
-    logical_expr::{Extension, LogicalPlan},
+    logical_expr::{Expr, Extension, LogicalPlan, Projection, SubqueryAlias},
     optimizer::{optimizer::Optimizer, OptimizerConfig, OptimizerRule},
     physical_expr::EquivalenceProperties,
     physical_plan::{
@@ -227,8 +227,39 @@ impl VirtualExecutionPlan {
     }
 
     fn plan_to_statement(&self, plan: &LogicalPlan) -> Result<Statement> {
-        Unparser::new(self.executor.dialect().as_ref()).plan_to_sql(plan)
+        let plan = project_subquery_alias_inputs(plan.clone())?;
+        Unparser::new(self.executor.dialect().as_ref()).plan_to_sql(&plan)
     }
+}
+
+/// Ensure every `SubqueryAlias` sits directly on a `Projection`.
+///
+/// When the alias wraps a non-projection input (e.g. `Filter -> TableScan` once
+/// `optimize_projections` has removed a redundant projection), the unparser
+/// renders the alias onto the base table (`FROM t AS a`) while expressions in
+/// the input keep the original qualifier (`WHERE t.x > 1`), which the remote
+/// rejects. An explicit projection makes the unparser emit a derived table
+/// (`FROM (SELECT ... FROM t WHERE t.x > 1) AS a`) instead.
+fn project_subquery_alias_inputs(plan: LogicalPlan) -> Result<LogicalPlan> {
+    plan.transform_up(|plan| {
+        let LogicalPlan::SubqueryAlias(alias) = &plan else {
+            return Ok(Transformed::no(plan));
+        };
+        if matches!(alias.input.as_ref(), LogicalPlan::Projection(_)) {
+            return Ok(Transformed::no(plan));
+        }
+        let input = Arc::clone(&alias.input);
+        let exprs = input
+            .schema()
+            .columns()
+            .into_iter()
+            .map(Expr::Column)
+            .collect::<Vec<_>>();
+        let projection = LogicalPlan::Projection(Projection::try_new(exprs, input)?);
+        let new_alias = SubqueryAlias::try_new(Arc::new(projection), alias.alias.clone())?;
+        Ok(Transformed::yes(LogicalPlan::SubqueryAlias(new_alias)))
+    })
+    .map(|t| t.data)
 }
 
 fn gather_analyzers(

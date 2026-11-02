@@ -211,3 +211,61 @@ async fn cross_provider_semi_join_prunes_columns() {
         "sqlite remote should only fetch `foo`: {sqlite_sql}"
     );
 }
+
+/// CTEs (subquery aliases) over a filtered remote scan, reused both in an
+/// `IN (SELECT ...)` against another remote and in a join, must unparse to SQL
+/// whose column qualifiers match the FROM clause.
+#[tokio::test]
+async fn cross_provider_cte_semi_join_and_join() {
+    use datafusion::execution::context::SessionContext;
+    use datafusion_federation::sql::MultiSchemaProvider;
+    use std::sync::Arc;
+
+    let sqlite_ctx = remote_ctx("test_sqlite", "test.csv").await;
+    let sqlite_exec = RecordingSQLExecutor::new("sqlite", "sqlite_exec", sqlite_ctx);
+    let sqlite_queries = sqlite_exec.queries();
+    let sqlite_schema = schema_provider(Arc::new(sqlite_exec), &["test_sqlite"]).await;
+
+    let pg_ctx = remote_ctx("test_pg", "test2.csv").await;
+    let pg_exec = RecordingSQLExecutor::new("postgres", "postgres_exec", pg_ctx);
+    let pg_queries = pg_exec.queries();
+    let pg_schema = schema_provider(Arc::new(pg_exec), &["test_pg"]).await;
+
+    let state = datafusion_federation::default_session_state();
+    support::overwrite_default_schema(
+        &state,
+        Arc::new(MultiSchemaProvider::new(vec![sqlite_schema, pg_schema])),
+    );
+    let ctx = SessionContext::new_with_state(state);
+
+    let query = "WITH p AS (SELECT foo, bar FROM test_pg WHERE bar >= 2), \
+        s AS (SELECT foo FROM test_sqlite WHERE foo IN (SELECT foo FROM p)) \
+        SELECT * FROM p JOIN s ON p.foo = s.foo";
+    let batches = support::collect(ctx.sql(query).await.expect("plan")).await;
+
+    // bar >= 2 on test_pg -> foo in {b..f}; intersect test_sqlite {a,b,c} -> b, c.
+    assert_eq!(row_count(&batches), 2);
+
+    let pg_sql = recorded_sql(&pg_queries);
+    assert!(
+        !pg_sql.contains("from test_pg as p"),
+        "alias must wrap a derived table, not the base table: {pg_sql}"
+    );
+    let sqlite_sql = recorded_sql(&sqlite_queries);
+    assert!(
+        !sqlite_sql.contains("bar"),
+        "sqlite remote should only fetch `foo`: {sqlite_sql}"
+    );
+}
+
+/// A table alias over a filtered scan unparses with consistent qualifiers.
+#[tokio::test]
+async fn aliased_table_with_filter() {
+    let ctx = remote_ctx("test", "test.csv").await;
+    let executor = RecordingSQLExecutor::new("sqlite", "sqlite_exec", ctx);
+    let schema = schema_provider(std::sync::Arc::new(executor), &["test"]).await;
+
+    let batches = run_federated(schema, "SELECT t.foo FROM test AS t WHERE t.bar > 1").await;
+
+    assert_eq!(row_count(&batches), 2);
+}
